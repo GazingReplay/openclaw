@@ -27,7 +27,11 @@ import {
   readEnvironmentValueSource,
   readManagedServiceEnvKeysFromEnvironment,
 } from "../daemon/service-managed-env.js";
-import { mergeServicePath, preserveServiceTmpDir } from "../daemon/service-path-policy.js";
+import {
+  mergeServicePath,
+  preserveServiceAccountHome,
+  preserveServiceTmpDir,
+} from "../daemon/service-path-policy.js";
 import {
   resolveManagedGatewayServiceCommand,
   type GatewayServiceCommandConfig,
@@ -531,6 +535,7 @@ async function buildGatewayInstallEnvironment(params: {
     includeRawKeys: true,
   });
   preserveServiceTmpDir(plan.environment, params.existingEnvironment, params.platform);
+  preserveServiceAccountHome(plan.environment, params.existingEnvironment, params.platform);
   const mergedPath = mergeServicePath(
     params.serviceEnvironment.PATH,
     params.existingEnvironment?.PATH,
