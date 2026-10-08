@@ -638,6 +638,8 @@ export async function buildGatewayInstallPlan(params: {
     runtime,
     existingNodeOptions: resolveManagedGatewayServiceCommand(params.existingCommand)?.environment
       ?.NODE_OPTIONS,
+    existingProgramArguments: resolveManagedGatewayServiceCommand(params.existingCommand)
+      ?.programArguments,
     launchdLabel:
       platform === "darwin"
         ? resolveGatewayLaunchAgentLabel(serviceInputEnv.OPENCLAW_PROFILE)
