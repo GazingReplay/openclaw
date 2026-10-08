@@ -355,12 +355,10 @@ it.each([{ count: "9", stale: true }])(
             },
       ),
     ]);
-    expect(native.task).toHaveBeenCalledExactlyOnceWith([
-      "/Query",
-      "/TN",
-      "OpenClaw Gateway",
-      "/XML",
-    ]);
+    expect(native.task).toHaveBeenCalledExactlyOnceWith(
+      ["/Query", "/TN", "OpenClaw Gateway", "/XML"],
+      undefined,
+    );
   },
 );
 

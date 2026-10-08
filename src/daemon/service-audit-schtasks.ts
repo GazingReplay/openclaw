@@ -7,10 +7,10 @@ import {
   getWindowsPowerShellExePath,
   getWindowsSystem32ExePath,
 } from "../infra/windows-install-roots.js";
-import { decodeWindowsLauncherScript } from "../infra/windows-launcher-encoding.js";
 import { hasCommandProcessCleanupError } from "../process/exec-result.js";
 import { execFileUtf8 } from "./exec-file.js";
 import { execSchtasks } from "./schtasks-exec.js";
+import { assertTaskInspectionDeadline, readTaskFile } from "./schtasks-inspection-deadline.js";
 import {
   buildTaskScript,
   buildHiddenLauncherScript,
@@ -60,8 +60,16 @@ function normalizeTaskScript(text: string, env: GatewayServiceEnv): string {
     .replace(/(?: --task-supervisor)?(?:\s*<\s*NUL)?$/iu, "");
 }
 
-const readLauncher = async (file: string) =>
-  decodeWindowsLauncherScript({ buffer: await fs.readFile(file) });
+function taskInspectionBudget(timeoutMs?: number) {
+  const deadline = timeoutMs === undefined ? undefined : performance.now() + timeoutMs;
+  return {
+    deadline,
+    remaining: () => {
+      assertTaskInspectionDeadline(deadline);
+      return deadline === undefined ? undefined : deadline - performance.now();
+    },
+  };
+}
 
 export async function auditWindowsServiceDefinition(
   env: GatewayServiceEnv,
@@ -74,6 +82,8 @@ export async function auditWindowsServiceDefinition(
     await auditScheduledTaskDefinition(env, findings, timeoutMs, expectedCommand);
     return;
   }
+  const { deadline, remaining } = taskInspectionBudget(timeoutMs);
+  remaining();
   const guards = getWindowsStartupRegistrationGuards(env, command);
   const sourcePath = resolveTaskScriptPath(env);
   if (
@@ -84,19 +94,21 @@ export async function auditWindowsServiceDefinition(
     throw new Error("Startup registration selects an unrecognized service script.");
   }
   const files = await Promise.all([sourcePath, ...guards].map(readServiceFileState));
+  remaining();
   const current = await readScheduledTaskCommand(env, {
     requireEffective: true,
     requireLoaded: true,
-    timeoutMs,
+    deadline,
   });
   if (
     !isDeepStrictEqual(command, current) ||
-    normalizeTaskScript(await readLauncher(sourcePath), env) !==
+    normalizeTaskScript(await readTaskFile(sourcePath, deadline), env) !==
       normalizeTaskScript(buildTaskScript(command), env) ||
     !isDeepStrictEqual(files, await Promise.all([sourcePath, ...guards].map(readServiceFileState)))
   ) {
     throw new Error("Startup service definition contains unrecognized or changed behavior.");
   }
+  remaining();
 }
 
 function elementKey(node: ReturnType<DOMParser["parseFromString"]>["documentElement"]): string {
@@ -112,12 +124,14 @@ export async function auditScheduledTaskDefinition(
   expectedCommand?: GatewayServiceExpectedCommand,
   expectedXml?: string,
 ): Promise<string> {
+  const { deadline, remaining } = taskInspectionBudget(timeoutMs);
   const sourcePath = resolveTaskScriptPath(env);
   const hiddenPath = resolveTaskLauncherScriptPath(
     { OPENCLAW_WINDOWS_TASK_HIDDEN_LAUNCHER: "1" },
     sourcePath,
   );
-  const query = await execSchtasks(["/Query", "/TN", resolveTaskName(env), "/XML"]);
+  const query = await execSchtasks(["/Query", "/TN", resolveTaskName(env), "/XML"], remaining());
+  remaining();
   if (query.code !== 0) {
     throw new Error("Scheduled Task definition could not be read.");
   }
@@ -193,8 +207,9 @@ export async function auditScheduledTaskDefinition(
         "-Command",
         `$ErrorActionPreference='Stop'; $names=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}')) | ConvertFrom-Json; foreach($name in $names) { try { ([Security.Principal.NTAccount]$name).Translate([Security.Principal.SecurityIdentifier]).Value } catch { Write-Output '-' } }`,
       ],
-      { timeout: timeoutMs ?? 15_000 },
+      { timeout: remaining() ?? 15_000 },
     );
+    remaining();
     const values = identity.stdout.trim().split(/\r?\n/u);
     if (identity.code === 0 && values.length === names.length) {
       names.forEach((name, index) => {
@@ -396,11 +411,12 @@ export async function auditScheduledTaskDefinition(
     }
   }
   if (expectedCommand) {
-    const command = await readScheduledTaskCommand(env, { requireEffective: true, timeoutMs });
+    remaining();
+    const command = await readScheduledTaskCommand(env, { requireEffective: true, deadline });
     const normalize = (text: string) => normalizeTaskScript(text, env);
     if (
       !command ||
-      normalize(await readLauncher(sourcePath)) !== normalize(buildTaskScript(command))
+      normalize(await readTaskFile(sourcePath, deadline)) !== normalize(buildTaskScript(command))
     ) {
       unknown("TaskScript", "The generated task script contains unrecognized behavior.");
     }
@@ -417,7 +433,7 @@ export async function auditScheduledTaskDefinition(
         scriptPath: sourcePath,
         taskSupervisor: command?.environment?.OPENCLAW_SERVICE_KIND === "gateway",
       });
-      const installedLauncher = await readLauncher(hiddenPath).catch((error: unknown) => {
+      const installedLauncher = await readTaskFile(hiddenPath, deadline).catch((error: unknown) => {
         if (!hiddenSelected && hasErrnoCode(error, "ENOENT")) {
           return undefined;
         }
@@ -433,6 +449,7 @@ export async function auditScheduledTaskDefinition(
       }
     }
   }
+  remaining();
   return xml;
 }
 
@@ -442,15 +459,7 @@ export async function readScheduledTaskDefinitionMutationCapability(
   options: Pick<GatewayServiceReadOptions, "timeoutMs"> & { environment?: GatewayServiceEnv } = {},
 ): Promise<ServiceDefinitionMutationCapability> {
   const unknown = { kind: "unknown", reason: "inspection-failed" } as const;
-  const deadline =
-    options.timeoutMs === undefined ? undefined : performance.now() + options.timeoutMs;
-  const remaining = () => {
-    const timeoutMs = deadline === undefined ? undefined : deadline - performance.now();
-    if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
-      throw new Error("Scheduled Task definition inspection deadline expired.");
-    }
-    return timeoutMs;
-  };
+  const { deadline, remaining } = taskInspectionBudget(options.timeoutMs);
   try {
     if (!resolveTaskUser(env)) {
       return unknown;
@@ -465,6 +474,7 @@ export async function readScheduledTaskDefinitionMutationCapability(
         requireEffective: true,
         requireLoaded: true,
         timeoutMs: remaining(),
+        deadline,
       });
     const command = await readCommand();
     const startup = command && getWindowsServiceRegistrationKind(command) === "startup";
@@ -505,6 +515,7 @@ export async function readScheduledTaskDefinitionMutationCapability(
           }
           throw error;
         });
+        remaining();
         if (entry && (!entry.isDirectory() || entry.isSymbolicLink())) {
           return unknown;
         }
@@ -514,6 +525,7 @@ export async function readScheduledTaskDefinitionMutationCapability(
       }
     }
     const files = await Promise.all(paths.map(readServiceFileState));
+    remaining();
     if (!command && files.some(Boolean)) {
       return unknown;
     }
@@ -536,7 +548,7 @@ export async function readScheduledTaskDefinitionMutationCapability(
       return unknown;
     }
     if (xml !== undefined) {
-      const current = await execSchtasks(["/Query", "/TN", taskName, "/XML"]);
+      const current = await execSchtasks(["/Query", "/TN", taskName, "/XML"], remaining());
       if (
         current.code !== 0 ||
         current.stdout.replace(/^\uFEFF/u, "").replaceAll(String.fromCharCode(0), "") !== xml
