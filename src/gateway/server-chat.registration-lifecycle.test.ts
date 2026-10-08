@@ -1,6 +1,10 @@
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { resetAgentEventsForTest } from "../infra/agent-events.js";
+import { createDeferred } from "../../test/helpers/promise.js";
+import {
+  getAgentEventLifecycleGeneration,
+  resetAgentEventsForTest,
+} from "../infra/agent-events.js";
 import { registerAgentRunContext } from "../infra/agent-run-registry.js";
 import {
   chatBroadcastCalls,
@@ -10,6 +14,12 @@ import {
 import { emitAgentEvent, registerChatRun } from "./server-chat.agent-events.test-helpers.js";
 import { createChatAbortMarker } from "./server-chat.js";
 import { broadcastChatError } from "./server-methods/chat-broadcast.js";
+import { loadGatewaySessionEntryReadOnlyInWorker } from "./session-utils-store-worker.js";
+
+vi.mock(import("./session-utils-store-worker.js"), async (importOriginal) => ({
+  ...(await importOriginal()),
+  loadGatewaySessionEntryReadOnlyInWorker: vi.fn(),
+}));
 
 vi.mock("../config/io.js", () => ({ getRuntimeConfig: vi.fn(() => ({})) }));
 vi.mock("../infra/heartbeat-visibility.js", () => ({
@@ -98,6 +108,118 @@ describe("chat run registration lifecycle", () => {
     expect(persistGatewaySessionLifecycleEventMock).not.toHaveBeenCalled();
     expect(h.chat().map(([, payload]) => payload.state)).not.toContain("error");
   });
+
+  it.each(["retry", "retry during recovery read", "definitive timeout"])(
+    "supersedes a grace error waiting for publication with %s",
+    async (next) => {
+      vi.useFakeTimers();
+      const sessionKey = "agent:main:publication-retry";
+      const runId = "run-publication-retry";
+      const h = createHarness({
+        resolveSessionKeyForRun: () => sessionKey,
+        lifecycleErrorRetryGraceMs: 100,
+      });
+      h.register(runId, sessionKey, runId);
+      await h.emit(runId, "lifecycle", { phase: "error", error: "retryable provider failure" });
+      const release = createDeferred();
+      const recoveryEntered = createDeferred();
+      const releaseRecovery = createDeferred();
+      let retryStart: void | Promise<void> = undefined;
+      if (next === "retry during recovery read") {
+        vi.mocked(loadGatewaySessionEntryReadOnlyInWorker).mockImplementationOnce(async () => {
+          recoveryEntered.resolve();
+          await releaseRecovery.promise;
+          return {
+            cfg: {},
+            agentId: "main",
+            storePath: "/tmp/recovery.sqlite",
+            canonicalKey: sessionKey,
+            storeKeys: [sessionKey],
+            store: {},
+            entry: undefined,
+            legacyKey: undefined,
+          };
+        });
+      }
+      const publication = h.handler.retireTranscript(
+        {
+          sessionKey,
+          assistantItemIds: ["late-draft"],
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Late draft" }],
+            __openclaw: { runId },
+          },
+        },
+        async (published) => {
+          await release.promise;
+          published();
+        },
+      );
+      try {
+        vi.advanceTimersByTime(100);
+        if (next !== "definitive timeout") {
+          retryStart = h.emit(
+            runId,
+            "lifecycle",
+            { phase: "start" },
+            {
+              seq: 2,
+              ...(next === "retry during recovery read"
+                ? { lifecycleGeneration: getAgentEventLifecycleGeneration() }
+                : {}),
+            },
+          );
+          if (next === "retry during recovery read") {
+            await recoveryEntered.promise;
+            release.resolve();
+            await publication;
+            expect(h.chat().map(([, payload]) => payload.state)).not.toContain("error");
+            releaseRecovery.resolve();
+          }
+          await retryStart;
+          await h.emit(runId, "assistant", { itemId: "retry", text: "Resumed reply" }, { seq: 3 });
+          release.resolve();
+          await publication;
+          expect(h.chat().map(([, payload]) => payload.state)).not.toContain("error");
+          expect(h.chatRunState.registry.peek(runId)?.clientRunId).toBe(runId);
+          expect(h.chatRunState.resolveBuffer(runId).text).toBe("Resumed reply");
+          expect(h.clearAgentRunContext).not.toHaveBeenCalled();
+          await h.end(runId, 4);
+          expect(h.chat().at(-1)?.[1]).toMatchObject({ state: "final", runId });
+        } else {
+          const terminal = h.emit(
+            runId,
+            "lifecycle",
+            {
+              phase: "error",
+              error: "Definitive timeout",
+              aborted: true,
+              stopReason: "timeout",
+            },
+            { seq: 2 },
+          );
+          release.resolve();
+          await publication;
+          await terminal;
+          expect(h.chat().map(([, payload]) => payload)).toEqual([
+            expect.objectContaining({
+              state: "error",
+              runId,
+              errorMessage: "Definitive timeout",
+              stopReason: "timeout",
+            }),
+          ]);
+          expect(h.chatRunState.registry.peek(runId)).toBeUndefined();
+        }
+      } finally {
+        release.resolve();
+        releaseRecovery.resolve();
+        await publication;
+        await retryStart;
+      }
+    },
+  );
 
   it("ignores stale aborted markers from older same-key runs for fresh chat lifecycle events (same-millisecond older sequence)", async () => {
     const h = createHarness({ now: 2_000 });

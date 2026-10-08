@@ -17,9 +17,10 @@ export function createAgentEventAdmission({
   handleEvent,
   resolveEventSession,
   isCurrent,
+  onLifecycleStartAccepted,
   dispose,
 }: {
-  handleEvent: (event: AgentEventPayload, recovery?: { suppress: boolean }) => void;
+  handleEvent: (event: AgentEventPayload, recovery?: { suppress: boolean }) => void | Promise<void>;
   resolveEventSession: (event: AgentEventRuntimePayload) => {
     chatLink?: ChatRunEntry;
     sessionAgentId?: string;
@@ -27,7 +28,8 @@ export function createAgentEventAdmission({
     sessionKey?: string;
   };
   isCurrent: (event: AgentEventRuntimePayload) => boolean;
-  dispose: () => void;
+  onLifecycleStartAccepted: (event: AgentEventRuntimePayload) => void;
+  dispose: () => void | Promise<void>;
 }) {
   const resolveRestartRecoveryLifecycleState = async (
     sessionKey: string,
@@ -83,6 +85,10 @@ export function createAgentEventAdmission({
       return;
     }
     const phase = evt.stream === "lifecycle" ? evt.data.phase : undefined;
+    if (phase === "start") {
+      // Retry admission revokes deferred errors before its recovery read yields.
+      onLifecycleStartAccepted(evt);
+    }
     const terminal =
       phase === "end" || phase === "error"
         ? buildAgentRunTerminalOutcomeFromLifecycleEvent({ phase, data: evt.data })
@@ -101,8 +107,9 @@ export function createAgentEventAdmission({
       needsRecoveryRead && sessionKey
         ? resolveRestartRecoveryLifecycleState(sessionKey, agentId, evt, previous)
         : undefined;
-    if (!prepared && !previous) {
-      return handleEvent(evt);
+    const immediate = !prepared && !previous ? handleEvent(evt) : undefined;
+    if (!prepared && !previous && !immediate) {
+      return;
     }
     const consume = async () => {
       const recovery = await prepared;
@@ -115,9 +122,9 @@ export function createAgentEventAdmission({
         return;
       }
       recovery?.assertCurrent?.();
-      handleEvent(evt, recovery);
+      await handleEvent(evt, recovery);
     };
-    const pending = previous ? previous.then(consume, consume) : consume();
+    const pending = immediate ?? (previous ? previous.then(consume, consume) : consume());
     pendingEvents.set(evt.runId, pending);
     const release = () => {
       if (pendingEvents.get(evt.runId) === pending) {
@@ -132,9 +139,9 @@ export function createAgentEventAdmission({
     {
       dispose: async () => {
         closed = true;
-        dispose();
+        await dispose();
         await Promise.allSettled(pendingEvents.values());
-        dispose();
+        await dispose();
       },
     },
   );

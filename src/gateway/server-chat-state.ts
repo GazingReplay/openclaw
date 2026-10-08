@@ -247,7 +247,7 @@ export function createChatRunState(isConnectionActive?: (connId: string) => bool
 
   const resolveBuffer = (
     runId: string,
-    options?: { final?: boolean },
+    options?: { final?: boolean; publishedOnly?: boolean },
   ): ReturnType<typeof projectLiveAssistantBufferedText> & { displayText?: string } => {
     const record = store.runs.get(runId);
     if (!record || record.bufferIsCurrent?.() === false) {
@@ -263,10 +263,10 @@ export function createChatRunState(isConnectionActive?: (connId: string) => bool
     };
     const createProjector = () => createLiveAssistantTextProjection(projectionOptions);
     const rawText = source;
-    const tail = assistantText.bufferVisibleText(record);
+    const tail = assistantText.bufferVisibleText(record, true);
     const contextEvicted = (record.rawOffset ?? 0) > 0;
-    const projectTail = (full: LiveDisplayState["current"]) => {
-      if (tail === source && !contextEvicted) {
+    const projectTail = (full: LiveDisplayState["current"], visibleTail = tail) => {
+      if (visibleTail === source && !contextEvicted) {
         return full;
       }
       // Missing source context cannot justify suppressing retained output.
@@ -278,8 +278,8 @@ export function createChatRunState(isConnectionActive?: (connId: string) => bool
       const text = suppressed
         ? ""
         : contextEvicted
-          ? tail
-          : normalizeLiveAssistantBufferedText(tail, projectionOptions);
+          ? visibleTail
+          : normalizeLiveAssistantBufferedText(visibleTail, projectionOptions);
       return {
         ...full,
         text,
@@ -290,17 +290,22 @@ export function createChatRunState(isConnectionActive?: (connId: string) => bool
     // Delivery remains complete; display finalizes the same occurrence-owned tail.
     if (options?.final) {
       const complete = createProjector().replace(source);
+      const finalTail = options.publishedOnly ? tail : assistantText.bufferVisibleText(record);
       return {
         ...complete,
-        ...(tail !== source || contextEvicted ? { displayText: projectTail(complete).text } : {}),
+        ...(finalTail !== source || contextEvicted
+          ? { displayText: projectTail(complete, finalTail).text }
+          : {}),
       };
     }
     let display = record.display;
     if (!display) {
       const projector = createProjector();
+      const full = projector.replace(rawText);
       display = record.display = {
         projector,
-        current: projectTail(projector.replace(rawText)),
+        full,
+        current: projectTail(full),
         unsentDelta: null,
       };
     } else if (display.reset || display.pendingRawDelta !== undefined) {
@@ -317,11 +322,11 @@ export function createChatRunState(isConnectionActive?: (connId: string) => bool
             ? rawText.slice(projector.source.length)
             : null
           : pendingRawDelta;
-      const next = projectTail(
+      display.full =
         delta == null
           ? display.projector.replace(rawText)
-          : display.projector.append(delta, rawText),
-      );
+          : display.projector.append(delta, rawText);
+      const next = projectTail(display.full);
       // A source append is a display append only when it continues the emitted baseline.
       const previous = display.current.suppress ? "" : display.current.text;
       const visible = next.suppress ? "" : next.text;
@@ -340,14 +345,19 @@ export function createChatRunState(isConnectionActive?: (connId: string) => bool
       delete display.reset;
     }
     record.buffer = display.current.text;
-    return display.current;
+    // Both views share source parsing. A committed snapshot cannot advance the
+    // wire's published baseline or consume its pending append delta.
+    return options?.publishedOnly
+      ? display.current
+      : projectTail(display.full, assistantText.bufferVisibleText(record));
   };
 
   const takeBufferDelta = (runId: string, text: string) => {
-    const projected = resolveBuffer(runId);
+    const projected = resolveBuffer(runId, { publishedOnly: true });
     const record = store.getOrCreate(runId);
     const display = (record.display ??= {
       projector: createLiveAssistantTextProjection(),
+      full: { ...projectLiveAssistantBufferedText(record.buffer ?? ""), delta: null },
       current: { ...projectLiveAssistantBufferedText(record.buffer ?? ""), delta: null },
       unsentDelta: null,
     });
@@ -384,8 +394,8 @@ export function createChatRunState(isConnectionActive?: (connId: string) => bool
       input: Parameters<typeof assistantText.updateBuffer>[1],
       source?: AgentAssistantSourceReceipt,
     ) => assistantText.updateBuffer(store.getOrCreate(runId), input, source),
-    retireBuffer: (runId: string, itemIds: readonly string[]) =>
-      assistantText.retireBuffer(store.getOrCreate(runId), itemIds),
+    retireBuffer: (runId: string, itemIds: readonly string[], published = false) =>
+      assistantText.retireBuffer(store.getOrCreate(runId), itemIds, published),
     retireSource: (runId: string, source: AgentAssistantSourceReceipt) =>
       assistantText.retireSource(store.runs.get(runId), source),
     takeBufferDelta,

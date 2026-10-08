@@ -12,7 +12,14 @@ export type ChatRunBufferState = {
   /** Positions are absolute; null ends retain identity facts after a source replacement. */
   assistantItems?: Map<
     string | symbol | undefined,
-    { itemId?: string; committed?: true; start?: number; end?: number | null; scope?: number }
+    {
+      itemId?: string;
+      committed?: true;
+      published?: true;
+      start?: number;
+      end?: number | null;
+      scope?: number;
+    }
   >;
   assistantScope?: AssistantTextSnapshot["scope"];
   assistantScopeOffset?: number;
@@ -20,6 +27,7 @@ export type ChatRunBufferState = {
   managedMediaUrls?: Set<string>;
   display?: {
     projector: ReturnType<typeof createLiveAssistantTextProjection>;
+    full: ReturnType<ReturnType<typeof createLiveAssistantTextProjection>["replace"]>;
     current: ReturnType<ReturnType<typeof createLiveAssistantTextProjection>["replace"]>;
     pendingRawDelta?: string | null;
     reset?: boolean;
@@ -35,13 +43,15 @@ const invalidateRange = (item: { start?: number; end?: number | null }) => {
   item.end = null;
 };
 
-export const bufferVisibleText = (record: ChatRunBufferState) => {
+export const bufferVisibleText = (record: ChatRunBufferState, publishedOnly = false) => {
   const text = record.rawBuffer ?? "";
   const offset = record.rawOffset ?? 0;
   const items = [...(record.assistantItems?.values() ?? [])]
     .filter((item) => typeof item.end === "number" && item.end > offset)
     .toSorted((a, b) => (a.start ?? 0) - (b.start ?? 0));
-  if (!items.some((item) => item.committed)) {
+  const retired = (item: (typeof items)[number]) =>
+    publishedOnly ? item.published : item.committed;
+  if (!items.some(retired)) {
     return text;
   }
   let visible = "";
@@ -55,7 +65,7 @@ export const bufferVisibleText = (record: ChatRunBufferState) => {
     const start = Math.max(offset, item.start ?? 0);
     gap += text.slice(cursor - offset, start - offset);
     cursor = Math.max(cursor, item.end);
-    if (item.committed) {
+    if (retired(item)) {
       continue;
     }
     let part = text.slice(start - offset, item.end - offset);
@@ -266,17 +276,26 @@ export const updateBuffer = (
   return text;
 };
 
-export const retireBuffer = (record: ChatRunBufferState, itemIds: readonly string[]) => {
+export const retireBuffer = (
+  record: ChatRunBufferState,
+  itemIds: readonly string[],
+  published = false,
+) => {
   const items = (record.assistantItems ??= new Map());
   let changed = false;
   for (const itemId of itemIds) {
     const item = items.get(itemId);
-    changed ||= !item?.committed && typeof item?.end === "number";
-    items.set(itemId, { ...item, committed: true });
+    changed ||= !(published ? item?.published : item?.committed) && typeof item?.end === "number";
+    items.set(itemId, { ...item, committed: true, ...(published ? { published: true } : {}) });
     for (const observed of items.values()) {
       if (observed.itemId === itemId) {
-        changed ||= !observed.committed && typeof observed.end === "number";
+        changed ||=
+          !(published ? observed.published : observed.committed) &&
+          typeof observed.end === "number";
         observed.committed = true;
+        if (published) {
+          observed.published = true;
+        }
       }
     }
   }

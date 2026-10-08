@@ -16,18 +16,13 @@ import {
   classifyAgentRunTerminalOutcome,
   isDefinitiveRunLifecycle,
 } from "../agents/agent-run-terminal-outcome.js";
-import { getTranscriptMessageRole } from "../agents/embedded-agent-runner/message-visibility.js";
 import { isActiveEmbeddedRunId } from "../agents/embedded-agent-runner/runs.js";
 import { isTimeoutError, resolveFailoverReasonFromError } from "../agents/failover-error.js";
 import { readToolValidationErrorSummary } from "../agents/tool-error-summary.js";
 import { normalizeVerboseLevel } from "../auto-reply/thinking.js";
 import { normalizeAgentPlanSteps } from "../channels/streaming.js";
 import { getRuntimeConfig } from "../config/io.js";
-import {
-  readAgentAssistantSource,
-  type AgentEventPayload,
-  type AgentEventRuntimePayload,
-} from "../infra/agent-events.js";
+import type { AgentEventPayload, AgentEventRuntimePayload } from "../infra/agent-events.js";
 import { getAgentRunContext, getAgentRunContextOwnerStatus } from "../infra/agent-run-registry.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { boundedJsonUtf8Bytes } from "../infra/json-utf8-bytes.js";
@@ -38,13 +33,9 @@ import {
   isSubagentSessionKey,
   parseCronRunScopeSuffix,
 } from "../sessions/session-key-utils.js";
-import {
-  readSessionTranscriptRunId,
-  type InternalSessionTranscriptUpdate,
-} from "../sessions/transcript-events.js";
+import type { InternalSessionTranscriptUpdate } from "../sessions/transcript-events.js";
 import { ASSISTANT_DISPLAY_CONTENT_FIELD } from "../shared/assistant-display-content.js";
 import { resolveAssistantEventPhase } from "../shared/chat-message-content.js";
-import { setSafeTimeout } from "../utils/timer-delay.js";
 import { resolveAssistantTextInput } from "./agent-event-assistant-text.js";
 import {
   appendChatCanvasBlocks,
@@ -60,6 +51,10 @@ import type {
   GatewayBroadcastOpts,
   GatewayBroadcastToConnIdsFn,
 } from "./server-broadcast-types.js";
+import {
+  createChatErrorGrace,
+  type ChatTerminalLifecycleOptions,
+} from "./server-chat-error-grace.js";
 import { createAgentEventAdmission } from "./server-chat-event-admission.js";
 import {
   normalizeHeartbeatChatFinalText,
@@ -90,6 +85,7 @@ import type {
   SessionMessageSubscriberRegistry,
 } from "./server-chat-state.js";
 import type { ToolEventRecipientRegistry } from "./server-chat-tool-recipients.js";
+import { createChatTranscriptPublication } from "./server-chat-transcript-publication.js";
 import { roundedChatSendTimingMs } from "./server-methods/chat-server-timing.js";
 import { hasSessionChangeReceivers } from "./session-change-receivers.js";
 import { withPreparedSessionEventRow } from "./session-event-prepared-row.js";
@@ -98,7 +94,6 @@ import { persistGatewaySessionLifecycleEvent } from "./session-lifecycle-state.j
 import { tryResolveSessionCompatibilityOwnerAgentId } from "./session-request-agent.js";
 import type { SessionRowProjection } from "./session-row-projection.js";
 import { resolveSessionSubscriptionKeys } from "./session-subscription-keys.js";
-import { readTranscriptMessageIdempotencyKey } from "./session-transcript-entry-message.js";
 import { loadGatewaySessionEntryReadOnly } from "./session-utils.js";
 import { formatForLog } from "./ws-log.js";
 
@@ -229,7 +224,10 @@ export type AgentEventHandlerOptions = {
 };
 
 type AgentEventHandler = ((event: AgentEventPayload) => void | Promise<void>) & {
-  retireTranscript: (event: InternalSessionTranscriptUpdate) => void;
+  retireTranscript: (
+    event: InternalSessionTranscriptUpdate,
+    publish: (published: () => void) => Promise<void>,
+  ) => Promise<void>;
   dispose: () => Promise<void>;
 };
 
@@ -297,41 +295,11 @@ export function createAgentEventHandler({
     return { chatLink, sessionAgentId, eventSessionKey, sessionKey };
   };
 
-  type TerminalLifecycleOptions = {
-    publishLifecycle?: boolean;
-    skipChatErrorFinal?: boolean;
-    suppressRestartRecoveryProjection?: boolean;
-    restartRecoveryState?: { suppress: boolean };
-  };
-  type PendingTerminalLifecycleError = {
-    timer: NodeJS.Timeout;
-    event: AgentEventRuntimePayload;
-    opts?: TerminalLifecycleOptions;
-  };
-
-  const pendingTerminalLifecycleErrors = new Map<string, PendingTerminalLifecycleError>();
-
   const cancelPendingChatDeltaFlush = (clientRunId: string) => {
     const record = chatRunState.runs.get(clientRunId);
     if (record) {
       cancelPendingLiveTextFlush(record, "chat");
     }
-  };
-
-  const clearPendingTerminalLifecycleError = (runId: string, lifecycleGeneration?: string) => {
-    const pending = pendingTerminalLifecycleErrors.get(runId);
-    if (!pending) {
-      return;
-    }
-    if (
-      lifecycleGeneration &&
-      pending.event.lifecycleGeneration &&
-      lifecycleGeneration !== pending.event.lifecycleGeneration
-    ) {
-      return;
-    }
-    clearTimeout(pending.timer);
-    pendingTerminalLifecycleErrors.delete(runId);
   };
 
   const resolveSpawnedBy = (sessionKey: string): string | null => {
@@ -403,9 +371,12 @@ export function createAgentEventHandler({
 
   const finalizeLifecycleEvent = (
     evt: AgentEventRuntimePayload,
-    opts?: TerminalLifecycleOptions,
-  ) => {
-    if (!shouldProcessOwnedEvent(evt.runId, evt.contextClaimId, evt.lifecycleGeneration)) {
+    opts?: ChatTerminalLifecycleOptions,
+  ): void | Promise<void> => {
+    if (
+      opts?.isCurrent?.() === false ||
+      !shouldProcessOwnedEvent(evt.runId, evt.contextClaimId, evt.lifecycleGeneration)
+    ) {
       return;
     }
     const lifecyclePhase =
@@ -427,6 +398,12 @@ export function createAgentEventHandler({
     const projectSessionMessages =
       evt.projectSessionMessages ?? currentRunContext?.projectSessionMessages ?? true;
     const clientRunId = chatLink?.clientRunId ?? evt.runId;
+    const publication = transcriptPublication.deferTerminal(evt.runId, clientRunId, () =>
+      finalizeLifecycleEvent(evt, opts),
+    );
+    if (publication) {
+      return publication;
+    }
     const isAborted =
       isChatAbortMarkerCurrent(chatRunState.runs.get(clientRunId)?.abortMarker, chatLink) ||
       isChatAbortMarkerCurrent(chatRunState.runs.get(evt.runId)?.abortMarker, chatLink);
@@ -453,7 +430,7 @@ export function createAgentEventHandler({
     if (isSupersededRestartRecoveryEvent) {
       return;
     }
-    clearPendingTerminalLifecycleError(evt.runId, evt.lifecycleGeneration);
+    terminalErrorGrace.clear(evt.runId, evt.lifecycleGeneration);
     let terminalPersistence: Promise<void> | undefined;
     // Completion retires the registration even when no visible terminal is published.
     // The peeked head is still current in this synchronous frame; delivery-owned runs wait.
@@ -638,22 +615,10 @@ export function createAgentEventHandler({
     }
   };
 
-  const scheduleTerminalLifecycleError = (
-    evt: AgentEventRuntimePayload,
-    opts?: TerminalLifecycleOptions,
-  ) => {
-    clearPendingTerminalLifecycleError(evt.runId);
-    const timer = setSafeTimeout(() => {
-      const pending = pendingTerminalLifecycleErrors.get(evt.runId);
-      if (!pending || pending.timer !== timer) {
-        return;
-      }
-      pendingTerminalLifecycleErrors.delete(evt.runId);
-      finalizeLifecycleEvent(pending.event, pending.opts);
-    }, lifecycleErrorRetryGraceMs);
-    timer.unref?.();
-    pendingTerminalLifecycleErrors.set(evt.runId, { timer, event: evt, opts });
-  };
+  const terminalErrorGrace = createChatErrorGrace({
+    delayMs: lifecycleErrorRetryGraceMs,
+    finalize: finalizeLifecycleEvent,
+  });
 
   const broadcastChatDelta = (
     sessionKey: string,
@@ -748,7 +713,7 @@ export function createAgentEventHandler({
       return;
     }
     const broadcastCurrent = (broadcastOptions: typeof opts) => {
-      const projected = chatRunState.resolveBuffer(clientRunId);
+      const projected = chatRunState.resolveBuffer(clientRunId, { publishedOnly: true });
       if (shouldHideHeartbeatChatOutput(clientRunId, sourceRunId, opts?.isHeartbeat)) {
         return;
       }
@@ -790,7 +755,7 @@ export function createAgentEventHandler({
     },
   ) => {
     cancelPendingChatDeltaFlush(clientRunId);
-    const { text, suppress } = chatRunState.resolveBuffer(clientRunId);
+    const { text, suppress } = chatRunState.resolveBuffer(clientRunId, { publishedOnly: true });
     const shouldSuppressHeartbeatStreaming = shouldHideHeartbeatChatOutput(
       clientRunId,
       sourceRunId,
@@ -882,7 +847,10 @@ export function createAgentEventHandler({
       isHeartbeat?: boolean;
     },
   ) => {
-    const terminalBuffer = chatRunState.resolveBuffer(clientRunId, { final: true });
+    const terminalBuffer = chatRunState.resolveBuffer(clientRunId, {
+      final: true,
+      publishedOnly: true,
+    });
     const normalizedHeartbeatText = normalizeHeartbeatChatFinalText({
       runId: clientRunId,
       sourceRunId,
@@ -1181,7 +1149,10 @@ export function createAgentEventHandler({
     nodeSendToSession(firstDeliveryKey, "agent", nodePayload, { sessionKeys: deliveryKeys });
   };
 
-  const handleEvent = (event: AgentEventPayload, restartRecoveryState?: { suppress: boolean }) => {
+  const handleEvent = (
+    event: AgentEventPayload,
+    restartRecoveryState?: { suppress: boolean },
+  ): void | Promise<void> => {
     const evt = event as AgentEventRuntimePayload;
     const isCurrent = shouldProcessOwnedEvent.bind(
       null,
@@ -1229,9 +1200,9 @@ export function createAgentEventHandler({
       ) ||
         restartRecoveryState?.suppress === true);
     if (suppressRestartRecoveryLifecycle) {
-      clearPendingTerminalLifecycleError(evt.runId, evt.lifecycleGeneration);
+      terminalErrorGrace.clear(evt.runId, evt.lifecycleGeneration);
       if (lifecyclePhase === "end" || lifecyclePhase === "error") {
-        finalizeLifecycleEvent(evt, {
+        return finalizeLifecycleEvent(evt, {
           suppressRestartRecoveryProjection: true,
           restartRecoveryState,
         });
@@ -1239,7 +1210,7 @@ export function createAgentEventHandler({
       return;
     }
     if (lifecyclePhase !== null && lifecyclePhase !== "error") {
-      clearPendingTerminalLifecycleError(evt.runId);
+      terminalErrorGrace.clear(evt.runId);
     }
     const publishLifecycle = evt.admitLifecyclePublication?.() ?? true;
 
@@ -1590,27 +1561,30 @@ export function createAgentEventHandler({
       // Only retryable failures get grace. Definitive cancellation and timeout
       // must persist before dispatch closes the run and the sidebar reads its status.
       if (isAborted || definitiveTerminal || lifecycleErrorRetryGraceMs <= 0) {
+        terminalErrorGrace.clear(evt.runId, evt.lifecycleGeneration);
         // finalizeLifecycleEvent clears the buffer itself, after emitChatTerminal
         // has flushed the throttled tail and resolved the terminal message.
-        finalizeLifecycleEvent(evt, { skipChatErrorFinal, publishLifecycle, restartRecoveryState });
-      } else {
-        if (evt.data.completionSource !== "reply-dispatch") {
-          // Runtime retries isolate failed text; reply-dispatch retains its
-          // post-hook payloads and abort state until its own completion settles.
-          chatRunState.clearRun(clientRunId);
-        }
-        scheduleTerminalLifecycleError(evt, {
+        return finalizeLifecycleEvent(evt, {
           skipChatErrorFinal,
           publishLifecycle,
           restartRecoveryState,
         });
       }
+      if (evt.data.completionSource !== "reply-dispatch") {
+        // Runtime retries isolate failed text; reply-dispatch retains its
+        // post-hook payloads and abort state until its own completion settles.
+        chatRunState.clearRun(clientRunId);
+      }
+      terminalErrorGrace.schedule(evt, {
+        skipChatErrorFinal,
+        publishLifecycle,
+        restartRecoveryState,
+      });
       return;
     }
 
     if (lifecyclePhase === "end") {
-      finalizeLifecycleEvent(evt, { publishLifecycle, restartRecoveryState });
-      return;
+      return finalizeLifecycleEvent(evt, { publishLifecycle, restartRecoveryState });
     }
 
     if (
@@ -1631,63 +1605,21 @@ export function createAgentEventHandler({
     }
   };
 
+  const transcriptPublication = createChatTranscriptPublication({
+    chatRunState,
+    agentRunSeq,
+    flushBufferedChatDeltaIfNeeded,
+  });
   const handler = createAgentEventAdmission({
     handleEvent,
     resolveEventSession,
     isCurrent: (evt) =>
       shouldProcessOwnedEvent(evt.runId, evt.contextClaimId, evt.lifecycleGeneration),
-    dispose: () => {
-      // Deferred provider errors cannot project into a successor subscription.
-      for (const pending of pendingTerminalLifecycleErrors.values()) {
-        clearTimeout(pending.timer);
-      }
-      pendingTerminalLifecycleErrors.clear();
-    },
+    onLifecycleStartAccepted: (evt) => terminalErrorGrace.clear(evt.runId, evt.lifecycleGeneration),
+    dispose: terminalErrorGrace.dispose,
   });
   return Object.assign(handler, {
-    retireTranscript: (event: InternalSessionTranscriptUpdate) => {
-      const sourceRunId = readSessionTranscriptRunId(event.message);
-      if (!sourceRunId || getTranscriptMessageRole(event.message) !== "assistant") {
-        return;
-      }
-      const link = chatRunState.registry.peek(sourceRunId);
-      const clientRunId = link?.clientRunId ?? sourceRunId;
-      const context = getAgentRunContext(sourceRunId);
-      const sessionKey = link?.sessionKey ?? context?.sessionKey;
-      const source = readAgentAssistantSource(event.message);
-      const mirrorKey = readTranscriptMessageIdempotencyKey(event.message);
-      const itemIds = [...(event.assistantItemIds ?? []), ...(mirrorKey ? [mirrorKey] : [])];
-      if (
-        (!source && itemIds.length === 0) ||
-        !sessionKey ||
-        sessionKey !== event.sessionKey ||
-        (context?.sessionId && context.sessionId !== event.sessionId)
-      ) {
-        return;
-      }
-      const run = chatRunState.getOrCreate(clientRunId);
-      if (
-        run.bufferIsCurrent?.() === false ||
-        isChatAbortMarkerCurrent(run.abortMarker, link) ||
-        !(source
-          ? chatRunState.retireSource(clientRunId, source)
-          : chatRunState.retireBuffer(clientRunId, itemIds))
-      ) {
-        return;
-      }
-      run.liveTextEpoch = {};
-      flushBufferedChatDeltaIfNeeded(
-        sessionKey,
-        link?.agentId ?? context?.agentId,
-        clientRunId,
-        sourceRunId,
-        agentRunSeq.get(sourceRunId) ?? 0,
-        {
-          controlUiVisible: context?.isControlUiVisible,
-          isHeartbeat: context?.isHeartbeat,
-        },
-      );
-    },
+    retireTranscript: transcriptPublication.retireTranscript,
   });
 }
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

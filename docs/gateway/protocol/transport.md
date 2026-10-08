@@ -64,10 +64,14 @@ Live text uses append deltas after an initial recipient snapshot. The
 assistant tail. Silent-reply suppression uses the full available source; the tail keeps existing directive and media normalization without being classified as a silent reply again. If the cap evicts source context, retained tail text stays visible conservatively. Cumulative snapshots or replacements that restore text evicted by the live buffer cap may redisplay committed text when ownership is unknown, preserving unsaved output.
 When durable history or a keyed
 commentary item takes ownership of live text, the Gateway sends an existing
-`replace: true` frame before subsequent append deltas. Terminal result snapshots
+`replace: true` frame before subsequent append deltas. A committed occurrence
+leaves history's live tail immediately, but remains in the wire tail until its
+saved row is published. Later live text continues during that handoff; terminal
+delivery waits for pending row publications. If a row cannot be published, its
+text remains in the terminal display for recovery. Terminal result snapshots
 retain their complete result in `message.content`. A buffer-backed terminal can
 also supply the existing `message.openclawDisplayContent` projection: the same
-unpersisted tail finalized for display, including an explicitly empty tail and
+unpublished tail finalized for display, including an explicitly empty tail and
 any Canvas blocks. The Control UI applies that projection before storing its
 live view; delivery consumers retain the complete content. An outer event
 sequence gap means a client may have lost part of that baseline: retire the

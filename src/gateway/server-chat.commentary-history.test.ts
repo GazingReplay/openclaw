@@ -325,15 +325,20 @@ it.each([
       }
       await gateway.emit(runId, "assistant", { itemId: "item-a", text: "Saved A." });
       gateway.chatRunState.flushPendingText(runId);
-      gateway.handler.retireTranscript({
-        sessionKey: "main",
-        message: { ...saved, idempotencyKey: "item-a" },
-      });
+      await gateway.handler.retireTranscript(
+        {
+          sessionKey: "main",
+          message: { ...saved, idempotencyKey: "item-a" },
+        },
+        async (published) => {
+          applySessionMessagePayload(state, { message: saved, runId }, true, {
+            kind: "live",
+            activeRunId: runId,
+          });
+          published();
+        },
+      );
       expect(gateway.chatRunState.resolveBuffer(runId).text).toBe("");
-      applySessionMessagePayload(state, { message: saved, runId }, true, {
-        kind: "live",
-        activeRunId: runId,
-      });
       if (includeSteer && !steerFirst) {
         applySteer();
       }
@@ -367,14 +372,19 @@ it.each([
           timestamp: Date.now() + 3,
           __openclaw: { id: "saved-b", seq: 4, runId, idempotencyKey: "item-b" },
         };
-        gateway.handler.retireTranscript({
-          sessionKey: "main",
-          message: { ...savedTail, idempotencyKey: "item-b" },
-        });
-        applySessionMessagePayload(state, { message: savedTail, runId }, true, {
-          kind: "live",
-          activeRunId: runId,
-        });
+        await gateway.handler.retireTranscript(
+          {
+            sessionKey: "main",
+            message: { ...savedTail, idempotencyKey: "item-b" },
+          },
+          async (published) => {
+            applySessionMessagePayload(state, { message: savedTail, runId }, true, {
+              kind: "live",
+              activeRunId: runId,
+            });
+            published();
+          },
+        );
       }
       if (canvas) {
         gateway.toolEventRecipients.add(runId, "control-ui");

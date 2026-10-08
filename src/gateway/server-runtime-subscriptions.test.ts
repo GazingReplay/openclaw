@@ -958,6 +958,10 @@ describe("startGatewayEventSubscriptions", () => {
     },
     transcriptBroadcastMocks,
     warn,
+    installHandlerFactory: (factory) => agentEventHandlerMocks.create.mockImplementation(factory),
+    stop: async () => {
+      await unsubs?.agentUnsub();
+    },
   });
 
   registerAssistantTailSubscriptionTests({

@@ -1,4 +1,3 @@
-import { EventEmitter } from "node:events";
 import path from "node:path";
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 import { GATEWAY_CLIENT_CAPS } from "../../packages/gateway-protocol/src/client-info.js";
@@ -28,9 +27,9 @@ import {
   createSessionEventSubscriberRegistry,
   createSessionMessageSubscriberRegistry,
 } from "./server-chat.js";
+import { connectChatWireClient } from "./server-chat.wire.test-support.js";
 import { broadcastChatFinal } from "./server-methods/chat-broadcast.js";
 import { GatewayClientRegistry } from "./server/client-registry.js";
-import type { GatewayWsClient } from "./server/ws-types.js";
 
 const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-chat-wire-cli-");
 
@@ -95,54 +94,8 @@ function answerCandidate(itemId: string, progressText: string, status = "candida
     hideFromChannelProgress: true,
   };
 }
-function connect(
-  clients: GatewayClientRegistry,
-  connId: string,
-  completeWrite: (callback?: () => void) => void = (callback) => callback?.(),
-  caps: string[] = [],
-) {
-  const frames: Array<{
-    event: string;
-    seq: number;
-    payload: {
-      stream?: string;
-      message?: unknown;
-      data?: { text?: string; delta?: string };
-      state?: string;
-      deltaText?: string;
-    };
-  }> = [];
-  const socket = Object.assign(new EventEmitter(), {
-    readyState: 1,
-    bufferedAmount: 0,
-    send: (
-      wire: string | Buffer,
-      options?: { binary: false } | (() => void),
-      callback?: () => void,
-    ) => {
-      frames.push(JSON.parse(wire.toString()));
-      completeWrite(typeof options === "function" ? options : callback);
-    },
-    close: vi.fn(),
-    terminate: vi.fn(),
-  });
-  const client = {
-    connId,
-    socket,
-    usesSharedGatewayAuth: false,
-    connect: {
-      minProtocol: 4,
-      maxProtocol: 4,
-      client: { id: "test", version: "test", platform: "test", mode: "test" },
-      role: "operator",
-      scopes: ["operator.read"],
-      caps,
-    },
-  } satisfies GatewayWsClient;
-  clients.add(client);
-  return { frames, client, socket };
-}
-type Frames = ReturnType<typeof connect>["frames"];
+
+type Frames = ReturnType<typeof connectChatWireClient>["frames"];
 const payloads = (frames: Frames, event: string) =>
   frames.filter((frame) => frame.event === event).map((frame) => frame.payload);
 const chatDeltaText = (frames: Frames) =>
@@ -184,23 +137,26 @@ it("replaces the wire baseline when a cumulative snapshot restores capped contex
 
 it("restores the wire baseline when an anonymous snapshot invalidates retired ownership", async () => {
   await using harness = createHarness();
-  const { frames } = connect(harness.clients, "viewer", undefined, [
+  const { frames } = connectChatWireClient(harness.clients, "viewer", undefined, [
     GATEWAY_CLIENT_CAPS.CHAT_ONLY_ASSISTANT_TEXT,
   ]);
   const runId = "anonymous-reset";
   const sessionKey = "agent:main:anonymous-reset";
   const emit = harness.registerRun(runId, sessionKey);
   await emit(1, "assistant", { itemId: "saved", text: "Saved." });
-  harness.handler.retireTranscript({
-    sessionKey,
-    messageSeq: 2,
-    assistantItemIds: ["saved"],
-    message: {
-      role: "assistant",
-      content: [{ type: "text", text: "Saved." }],
-      __openclaw: { runId },
+  await harness.handler.retireTranscript(
+    {
+      sessionKey,
+      messageSeq: 2,
+      assistantItemIds: ["saved"],
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Saved." }],
+        __openclaw: { runId },
+      },
     },
-  });
+    async (published) => published(),
+  );
   expect(payloads(frames, "chat").at(-1)).toMatchObject({ deltaText: "", replace: true });
   await emit(2, "assistant", { text: "Saved. More." });
   vi.advanceTimersByTime(75);
@@ -213,7 +169,7 @@ it.each([false, true])(
   "keeps literal control tails through the terminal wire flush (capped=%s)",
   async (capped) => {
     await using harness = createHarness();
-    const { frames } = connect(harness.clients, "viewer", undefined, [
+    const { frames } = connectChatWireClient(harness.clients, "viewer", undefined, [
       GATEWAY_CLIENT_CAPS.CHAT_ONLY_ASSISTANT_TEXT,
     ]);
     const runId = "literal-control";
@@ -223,16 +179,19 @@ it.each([false, true])(
     const tail = `${SILENT_REPLY_TOKEN}.`;
     await emit(1, "assistant", { itemId: "native", occurrenceId: "a", text: prefix });
     await emit(2, "assistant", { itemId: "native", occurrenceId: "b", text: prefix + tail });
-    harness.handler.retireTranscript({
-      sessionKey,
-      messageSeq: 2,
-      assistantItemIds: ["a"],
-      message: {
-        role: "assistant",
-        content: [{ type: "text", text: prefix }],
-        __openclaw: { runId },
+    await harness.handler.retireTranscript(
+      {
+        sessionKey,
+        messageSeq: 2,
+        assistantItemIds: ["a"],
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: prefix }],
+          __openclaw: { runId },
+        },
       },
-    });
+      async (published) => published(),
+    );
     const display = harness.chatRunState.resolveBuffer(runId).text;
     expect(display.trim()).toBe(tail);
     await emitLifecycleEnd(harness.handler, runId, 3);
@@ -259,17 +218,20 @@ it.each(["Hello new", ""])(
     const sessionKey = "agent:main:native-receipt";
     const emit = harness.registerRun("native-receipt", sessionKey);
     await emit(1, "assistant", { itemId: "partial", text: "Hello" });
-    harness.handler.retireTranscript({
-      sessionKey,
-      messageSeq: 2,
-      assistantItemIds: ["partial"],
-      message: {
-        role: "assistant",
-        content: [{ type: "text", text }],
-        idempotencyKey: "terminal-receipt",
-        __openclaw: { runId: "native-receipt" },
+    await harness.handler.retireTranscript(
+      {
+        sessionKey,
+        messageSeq: 2,
+        assistantItemIds: ["partial"],
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text }],
+          idempotencyKey: "terminal-receipt",
+          __openclaw: { runId: "native-receipt" },
+        },
       },
-    });
+      async (published) => published(),
+    );
     expect(harness.chatRunState.resolveBuffer("native-receipt").text).toBe("");
     await emit(2, "assistant", {
       itemId: "terminal-receipt",
@@ -292,17 +254,20 @@ it("preserves an unfinished native replacement when an earlier matching prefix p
     replace: true,
     replaceable: true,
   });
-  harness.handler.retireTranscript({
-    sessionKey,
-    messageSeq: 2,
-    assistantItemIds: ["completed"],
-    message: {
-      role: "assistant",
-      content: [{ type: "text", text: "Same." }],
-      idempotencyKey: "codex-app-server:thread:turn:assistant:completed",
-      __openclaw: { runId: "native-steer" },
+  await harness.handler.retireTranscript(
+    {
+      sessionKey,
+      messageSeq: 2,
+      assistantItemIds: ["completed"],
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Same." }],
+        idempotencyKey: "codex-app-server:thread:turn:assistant:completed",
+        __openclaw: { runId: "native-steer" },
+      },
     },
-  });
+    async (published) => published(),
+  );
   expect(harness.chatRunState.resolveBuffer("native-steer").text).toBe("Same. tail");
 });
 
@@ -330,16 +295,19 @@ it.each([
     }
     await emit(1, "captured", prefix, prefix);
     await emit(2, "tail", `${prefix}B`, "B");
-    harness.handler.retireTranscript({
-      sessionKey,
-      messageSeq: 2,
-      assistantItemIds: [...(preceding ? ["earlier"] : []), "captured"],
-      message: {
-        role: "assistant",
-        content: [{ type: "text", text: prefix }],
-        __openclaw: { runId },
+    await harness.handler.retireTranscript(
+      {
+        sessionKey,
+        messageSeq: 2,
+        assistantItemIds: [...(preceding ? ["earlier"] : []), "captured"],
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: prefix }],
+          __openclaw: { runId },
+        },
       },
-    });
+      async (published) => published(),
+    );
     const tail = projectInFlightRunSnapshot({ chatRunState: harness.chatRunState, runId }).text;
     expectCapturedTail(tail, "B", prefix);
     expect(harness.chatRunState.resolveBuffer(runId, { final: true }).text).toBe(
@@ -366,26 +334,29 @@ it.each([
   "preserves the next answer after clearing a native item ($name)",
   async ({ saved, preceding }) => {
     await using harness = createHarness();
-    const { frames } = connect(harness.clients, "control-ui");
+    const { frames } = connectChatWireClient(harness.clients, "control-ui");
     const runId = "cleared-native-item";
     const sessionKey = "agent:main:cleared-native-item";
     const emit = harness.registerRun(runId, sessionKey);
     const commit = (itemId: string, text: string) =>
-      harness.handler.retireTranscript({
-        sessionKey,
-        assistantItemIds: [itemId],
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text }],
-          __openclaw: { runId },
+      harness.handler.retireTranscript(
+        {
+          sessionKey,
+          assistantItemIds: [itemId],
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text }],
+            __openclaw: { runId },
+          },
         },
-      });
+        async (published) => published(),
+      );
     if (preceding) {
       await emit(0, "assistant", { itemId: "earlier", text: "Earlier." });
-      commit("earlier", "Earlier.");
+      await commit("earlier", "Earlier.");
     }
     await emit(1, "assistant", { itemId: "native", occurrenceId: "saved", text: saved });
-    commit("saved", saved);
+    await commit("saved", saved);
     await emit(2, "assistant", { itemId: "native", occurrenceId: "pending", text: `${saved}B` });
     expectCapturedTail(
       projectInFlightRunSnapshot({ chatRunState: harness.chatRunState, runId }).text,
@@ -400,7 +371,7 @@ it.each([
     });
     expect(projectInFlightRunSnapshot({ chatRunState: harness.chatRunState, runId }).text).toBe("");
     await emit(4, "assistant", { itemId: "answer", text: "Done" });
-    commit("saved", saved);
+    await commit("saved", saved);
     harness.chatRunState.flushPendingText(runId);
     expect(projectInFlightRunSnapshot({ chatRunState: harness.chatRunState, runId }).text).toBe(
       "Done",
@@ -519,24 +490,27 @@ it.each([
 
 it("keeps unidentified third-party text live through unrelated commits", async () => {
   await using harness = createHarness();
-  const { frames } = connect(harness.clients, "existing", undefined, [
+  const { frames } = connectChatWireClient(harness.clients, "existing", undefined, [
     GATEWAY_CLIENT_CAPS.CHAT_ONLY_ASSISTANT_TEXT,
   ]);
   const sessionKey = "agent:main:unkeyed-replacement";
   const runId = "unkeyed-replacement";
   const emit = harness.registerRun(runId, sessionKey);
   const persist = (messageSeq: number) =>
-    harness.handler.retireTranscript({
-      sessionKey,
-      messageSeq,
-      message: {
-        role: "assistant",
-        content: [{ type: "text", text: "Saved." }],
-        __openclaw: { runId },
+    harness.handler.retireTranscript(
+      {
+        sessionKey,
+        messageSeq,
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Saved." }],
+          __openclaw: { runId },
+        },
       },
-    });
+      async (published) => published(),
+    );
   await emit(1, "assistant", { text: "Draft" });
-  persist(2);
+  await persist(2);
   const replacement = "Saved.\n\nNew answer";
   await emit(2, "assistant", { text: replacement, replace: true });
   expect(projectInFlightRunSnapshot({ chatRunState: harness.chatRunState, runId }).text).toBe(
@@ -549,7 +523,7 @@ it("keeps unidentified third-party text live through unrelated commits", async (
   await emit(3, "assistant", { delta: " More." });
   vi.advanceTimersByTime(75);
   expect(payloads(frames, "chat").at(-1)).toMatchObject({ deltaText: " More." });
-  persist(3);
+  await persist(3);
   expect(projectInFlightRunSnapshot({ chatRunState: harness.chatRunState, runId }).text).toBe(
     "Saved.\n\nNew answer More.",
   );
@@ -559,29 +533,32 @@ it.each(["Tail.", "    const value = 1;"])(
   "replaces committed live text and continues tail %j for existing and returning clients",
   async (tail) => {
     await using harness = createHarness({ canReceiveSessionEvent: () => true });
-    const { frames } = connect(harness.clients, "existing", undefined, [
+    const { frames } = connectChatWireClient(harness.clients, "existing", undefined, [
       GATEWAY_CLIENT_CAPS.CHAT_ONLY_ASSISTANT_TEXT,
     ]);
     const sessionKey = "agent:main:tail";
     const emit = harness.registerRun("tail-run", sessionKey);
     await emit(1, "assistant", { itemId: "saved", text: "Saved.", delta: "Saved." });
     await emit(2, "assistant", { itemId: "tail", text: tail, delta: tail });
-    harness.handler.retireTranscript({
-      sessionKey,
-      messageSeq: 2,
-      message: {
-        role: "assistant",
-        idempotencyKey: "saved",
-        content: [{ type: "text", text: "Saved." }],
-        __openclaw: { runId: "tail-run" },
+    await harness.handler.retireTranscript(
+      {
+        sessionKey,
+        messageSeq: 2,
+        message: {
+          role: "assistant",
+          idempotencyKey: "saved",
+          content: [{ type: "text", text: "Saved." }],
+          __openclaw: { runId: "tail-run" },
+        },
       },
-    });
+      async (published) => published(),
+    );
     expect(payloads(frames, "chat").at(-1)).toMatchObject({
       replace: true,
       deltaText: tail,
       message: { content: [{ type: "text", text: tail }] },
     });
-    const { frames: returning } = connect(harness.clients, "returning", undefined, [
+    const { frames: returning } = connectChatWireClient(harness.clients, "returning", undefined, [
       GATEWAY_CLIENT_CAPS.CHAT_ONLY_ASSISTANT_TEXT,
     ]);
     expect(harness.chatRunState.resolveBuffer("tail-run").text).toBe(tail);
@@ -608,8 +585,8 @@ it("keeps non-text agent events for chat-only clients", async () => {
   const onBroadcast = vi.fn();
   await using harness = createHarness({ onBroadcast, canReceiveSessionEvent: () => true });
   const { clients } = harness;
-  const { frames: legacy } = connect(clients, "legacy");
-  const { frames: chatOnly } = connect(clients, "chat-only", undefined, [
+  const { frames: legacy } = connectChatWireClient(clients, "legacy");
+  const { frames: chatOnly } = connectChatWireClient(clients, "chat-only", undefined, [
     GATEWAY_CLIENT_CAPS.CHAT_ONLY_ASSISTANT_TEXT,
   ]);
   const runId = "progress-run";
@@ -649,8 +626,8 @@ it("sends append-only wire text while retaining snapshots for observers and late
   let visible = true;
   await using harness = createHarness({ canReceiveSessionEvent: () => visible });
   const { clients, handler, chatRunState } = harness;
-  const { frames } = connect(clients, "first");
-  const { frames: chatOnly } = connect(clients, "chat-only", undefined, [
+  const { frames } = connectChatWireClient(clients, "first");
+  const { frames: chatOnly } = connectChatWireClient(clients, "chat-only", undefined, [
     GATEWAY_CLIENT_CAPS.CHAT_ONLY_ASSISTANT_TEXT,
   ]);
   registerChatRun(chatRunState, "wire-run", "agent:main:wire", "wire-run");
@@ -671,7 +648,7 @@ it("sends append-only wire text while retaining snapshots for observers and late
     chatRunState.flushPendingText("wire-run");
   };
   await emit(1, undefined, "Hello");
-  const { frames: late } = connect(clients, "late");
+  const { frames: late } = connectChatWireClient(clients, "late");
   await emit(2, undefined, " world");
   expect(payloads(frames, "chat")).toEqual([
     expect.objectContaining({
@@ -710,16 +687,19 @@ it("sends append-only wire text while retaining snapshots for observers and late
   );
   await emit(7, "Reset! again", " again");
   expect(payloads(frames, "agent").at(-1)?.data?.text).toBe("Reset! again");
-  handler.retireTranscript({
-    sessionKey: "agent:main:wire",
-    messageSeq: 1,
-    assistantItemIds: ["other"],
-    message: {
-      role: "assistant",
-      content: [{ type: "text", text: "Other" }],
-      __openclaw: { runId: "wire-run" },
+  await handler.retireTranscript(
+    {
+      sessionKey: "agent:main:wire",
+      messageSeq: 1,
+      assistantItemIds: ["other"],
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Other" }],
+        __openclaw: { runId: "wire-run" },
+      },
     },
-  });
+    async (published) => published(),
+  );
   expect(projectInFlightRunSnapshot({ chatRunState, runId: "wire-run" }).text).toBe(
     "Reset!\n\nReset! again",
   );
@@ -747,7 +727,7 @@ it.each(["immediate", "paced", "slow"])(
     const { clients, broadcaster, handler, chatRunState } = harness;
     const callbacks: Array<() => void> = [];
     let hold = false;
-    const { frames } = connect(clients, "cli-reader", (callback) => {
+    const { frames } = connectChatWireClient(clients, "cli-reader", (callback) => {
       if (callback && hold) {
         callbacks.push(callback);
       } else {
@@ -835,7 +815,9 @@ it("retires a real CLI reply before its corrected source snapshot arrives", asyn
       return harness.handler(event);
     }
   });
-  const stopTranscript = onInternalSessionTranscriptUpdate(harness.handler.retireTranscript);
+  const stopTranscript = onInternalSessionTranscriptUpdate((event) => {
+    void harness.handler.retireTranscript(event, async (published) => published());
+  });
   try {
     cli.emitCliAssistantDelta({ text: "Preview", delta: "Preview" });
     await stopEvents.drain();
@@ -871,8 +853,8 @@ it.each([true, false])(
   async (visible) => {
     await using harness = createHarness();
     const { clients, handler, chatRunState } = harness;
-    const { frames } = connect(clients, "gap-reader");
-    const { frames: chatOnly } = connect(clients, "chat-only", undefined, [
+    const { frames } = connectChatWireClient(clients, "gap-reader");
+    const { frames: chatOnly } = connectChatWireClient(clients, "chat-only", undefined, [
       GATEWAY_CLIENT_CAPS.CHAT_ONLY_ASSISTANT_TEXT,
     ]);
     const runId = "gap-run";
@@ -917,7 +899,7 @@ it.each(["native", "dispatch", "abort", "retry", "clearRun", "clear"] as const)(
     await using harness = createHarness();
     const { chatRunState, nodeSendToSession, clients, broadcaster } = harness;
     const callbacks: Array<() => void> = [];
-    const { frames, client, socket } = connect(clients, "held-reader", (callback) => {
+    const { frames, client, socket } = connectChatWireClient(clients, "held-reader", (callback) => {
       if (callback) {
         callbacks.push(callback);
       }

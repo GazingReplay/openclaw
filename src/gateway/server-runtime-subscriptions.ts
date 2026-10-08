@@ -634,12 +634,15 @@ export function startGatewayEventSubscriptions(params: {
     channelAdmissionAudit.close();
     // A missing-key terminal can still be resolving its persisted run mapping.
     // Join dispatch first so handler consumption precedes persistence drain.
-    await Promise.allSettled(agentEventDispatches);
+    while (agentEventDispatches.size > 0) {
+      await Promise.allSettled(agentEventDispatches);
+    }
     await agentEventHandlerLoader
       .peek()
       ?.then((handler) => handler.dispose())
       .catch(() => undefined);
     await sessionLifecyclePersistence.drain();
+    transcriptUnsub();
     // Terminal persistence can publish further committed transcript updates.
     while (agentEventDispatches.size > 0) {
       await Promise.allSettled(agentEventDispatches);
@@ -653,18 +656,19 @@ export function startGatewayEventSubscriptions(params: {
 
   const transcriptUnsub = onInternalSessionTranscriptUpdate((evt) => {
     sessionActivitySummaries.handleTranscript(evt);
-    // Share the agent queue so a later cumulative update cannot outrun retirement.
+    // Retire history immediately, holding live replacement/terminal delivery until
+    // the transcript publisher has supplied the row to the same subscribers.
     const agentHandler = agentEventHandlerLoader.peek();
     const dispatch = runOutsideAsyncWorkScope(() =>
       dispatchEventHandler<InternalSessionTranscriptUpdate>({
         loadHandler: agentHandler
           ? () =>
-              agentHandler
-                .then(
-                  (handler) => handler.retireTranscript(evt),
-                  () => undefined,
-                )
-                .then(getTranscriptUpdateHandler)
+              agentHandler.then((handler) => {
+                const publication = handler.retireTranscript(evt, (published) =>
+                  getTranscriptUpdateHandler().then((publish) => publish(evt, published)),
+                );
+                return () => publication;
+              }, getTranscriptUpdateHandler)
           : getTranscriptUpdateHandler,
         event: evt,
         log: params.log,
