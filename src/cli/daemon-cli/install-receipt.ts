@@ -39,8 +39,24 @@ const INSTALL_CONFLICT =
 const OBSERVATION_FAILURE =
   "Gateway readiness could not be verified. Inspect openclaw gateway status --deep before retrying.";
 
+const RECONCILIATION_OUTCOMES = [
+  [
+    "SERVICE_DEFINITION_UNKNOWN: Service definition inspection or backup failed; the definition was preserved: ",
+    "left unchanged",
+  ],
+  [
+    "SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was left unchanged: ",
+    "left unchanged",
+  ],
+  [
+    "SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was restored: ",
+    "restored",
+  ],
+] as const;
+
 function safeInstallFailure(message: string | undefined): string {
   let detail = message ?? "";
+  let recovery: "restored" | "left unchanged" | undefined;
   for (let depth = 0; depth < 6; depth++) {
     if (
       detail === STALE_RUNTIME_PIN ||
@@ -61,16 +77,17 @@ function safeInstallFailure(message: string | undefined): string {
       // A later conflict cannot attest that every service artifact stayed unchanged.
       return INSTALL_CONFLICT;
     }
-    const wrapper = [
-      "Gateway install failed: ",
-      "Error: ",
-      "SERVICE_DEFINITION_UNKNOWN: Service definition inspection or backup failed; the definition was preserved: ",
-      "SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was left unchanged: ",
-      "SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was restored: ",
-    ].find((prefix) => detail.startsWith(prefix));
+    const reconciliation = RECONCILIATION_OUTCOMES.find(([prefix]) => detail.startsWith(prefix));
+    const wrapper =
+      reconciliation?.[0] ??
+      ["Gateway install failed: ", "Error: "].find((prefix) => detail.startsWith(prefix));
     if (!wrapper) {
-      break;
+      return recovery
+        ? `Gateway runtime installation failed. The previous service definition was ${recovery}. Inspect openclaw gateway status --deep before retrying; no automatic retry was attempted.`
+        : INSTALL_FAILURE;
     }
+    // Inner diagnostics cannot replace the enclosing owner's verified recovery outcome.
+    recovery ??= reconciliation?.[1];
     detail = detail.slice(wrapper.length);
   }
   return INSTALL_FAILURE;

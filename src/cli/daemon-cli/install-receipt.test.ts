@@ -320,6 +320,16 @@ describe("desktop runtime receipt", () => {
     },
     {
       error:
+        "Gateway install failed: Error: SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was restored: Error: Runtime pin changed during service planning; rerun the install.",
+      phase: "before",
+    },
+    {
+      error:
+        "Gateway install failed: Error: SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was restored: Error: SERVICE_DEFINITION_UNKNOWN: Scheduled Task changed.",
+      phase: "during",
+    },
+    {
+      error:
         "Gateway install failed: Error: Runtime pin changed during service planning; rerun the install. private-token",
       phase: "unknown",
     },
@@ -335,6 +345,78 @@ describe("desktop runtime receipt", () => {
             : "Gateway runtime installation failed. Inspect openclaw gateway status --deep before retrying; no automatic retry was attempted.",
       );
       expect(fs.readFileSync(target, "utf8")).not.toContain("private-token");
+    } finally {
+      receipt.close();
+    }
+  });
+
+  it.each([
+    {
+      name: "restored definition after the native publish failure",
+      error:
+        "Gateway install failed: Error: SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was restored: Error: EPERM: operation not permitted, rename 'C:\\private-token\\.gateway.cmd.tmp' -> 'C:\\private-token\\gateway.cmd'",
+      outcome: "restored",
+    },
+    {
+      name: "unchanged definition after failed refresh",
+      error:
+        "Gateway install failed: Error: SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was left unchanged: Error: private-token",
+      outcome: "left unchanged",
+    },
+    {
+      name: "preserved definition after failed backup",
+      error:
+        "Gateway install failed: Error: SERVICE_DEFINITION_UNKNOWN: Service definition inspection or backup failed; the definition was preserved: Error: EACCES private-token",
+      outcome: "left unchanged",
+    },
+    {
+      name: "outer unchanged outcome despite nested restored text",
+      error:
+        "Gateway install failed: Error: SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was left unchanged: SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was restored: Error: private-token",
+      outcome: "left unchanged",
+    },
+    {
+      name: "outer restored outcome despite nested unchanged text",
+      error:
+        "Gateway install failed: Error: SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was restored: SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was left unchanged: Error: private-token",
+      outcome: "restored",
+    },
+    {
+      name: "unverified recovery containing nested restored text",
+      error:
+        "Gateway install failed: GatewayServiceAuthorityError: UPDATE_NATIVE_AUTHORITY: Service definition recovery is unverified: private-token SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was restored: Error: private-token",
+      outcome: "unknown",
+    },
+    {
+      name: "unrecognized outer failure containing restored text",
+      error:
+        "Gateway install failed: Error: private-token SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was restored: Error: private-token",
+      outcome: "unknown",
+    },
+    {
+      name: "unresolved failure beyond the wrapper limit",
+      error:
+        "Error: ".repeat(5) +
+        "SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was restored: private-token",
+      outcome: "unknown",
+    },
+    {
+      name: "near-match recovery wrapper",
+      error:
+        "Gateway install failed: Error: SERVICE_DEFINITION_UNKNOWN: Service definition refresh failed; the previous definition was restored unexpectedly: private-token",
+      outcome: "unknown",
+    },
+  ])("projects only the safe $name", ({ error, outcome }) => {
+    const receipt = prepare();
+    try {
+      receipt.emit({ action: "install", ok: false, error, warnings: ["private-warning"] });
+      const result = read();
+      expect(result.install.error).toBe(
+        `Gateway runtime installation failed. ${outcome === "unknown" ? "" : `The previous service definition was ${outcome}. `}Inspect openclaw gateway status --deep before retrying; no automatic retry was attempted.`,
+      );
+      expect(result.install.ok).toBe(false);
+      expect(result.observation).toBeNull();
+      expect(fs.readFileSync(target, "utf8")).not.toContain("private-");
     } finally {
       receipt.close();
     }
