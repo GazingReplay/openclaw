@@ -5,7 +5,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { auditGatewayInstallPreservation } from "../daemon/service-audit-preservation.js";
 import type { ServiceDefinitionDrift } from "../daemon/service-audit-types.js";
-import * as boundaryPath from "../infra/boundary-path.js";
 
 vi.mock("../daemon/runtime-paths.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/runtime-paths.js")>()),
@@ -29,7 +28,7 @@ type TempCase = {
   previousKey?: string;
   unavailable?: "previous" | "proposed" | "stat";
   file?: boolean;
-  canonicalCase?: boolean;
+  identity?: "zero-inode" | "other-device" | "unsafe-number";
   retain?: boolean;
 };
 
@@ -98,12 +97,15 @@ describe("Gateway install temporary directory preservation", () => {
     { name: "long to short when reinstalling Node", runtime: "node", retain: true },
     { name: "short to long", previous: shortTemp, proposed: longTemp, retain: true },
     { name: "case-insensitive installed environment key", previousKey: "TmpDir", retain: true },
-    { name: "canonical namespace and case differences", canonicalCase: true, retain: true },
+    { name: "extended-length proposed spelling", proposed: `\\\\?\\${shortTemp}`, retain: true },
     { name: "different directory", proposed: otherTemp },
     { name: "missing installed directory", unavailable: "previous" },
     { name: "missing proposed directory", unavailable: "proposed" },
     { name: "uninspectable directory metadata", unavailable: "stat" },
     { name: "resolved regular file", file: true },
+    { name: "unavailable inode identity", identity: "zero-inode" },
+    { name: "same inode on different devices", identity: "other-device" },
+    { name: "distinct inode identities beyond number precision", identity: "unsafe-number" },
     { name: "relative installed value", previous: "relative-temp" },
     { name: "drive-relative installed value", previous: "C:Temp" },
     { name: "rooted value without a drive", previous: "\\Temp" },
@@ -113,35 +115,39 @@ describe("Gateway install temporary directory preservation", () => {
     const home = tempDirs.make("oc-plan-tmpdir-");
     const directory = path.join(home, "real-temp");
     fs.mkdirSync(directory);
+    const differentDirectory = path.join(home, "different-temp");
+    fs.mkdirSync(differentDirectory);
     const file = path.join(home, "not-a-directory");
     fs.writeFileSync(file, "");
     const previous = testCase.previous ?? longTemp;
     const proposed = testCase.proposed ?? shortTemp;
-    const canonical = testCase.canonicalCase ? `\\\\?\\${longTemp}` : longTemp;
-    const proposedCanonical =
-      proposed === otherTemp
-        ? otherTemp
-        : testCase.canonicalCase
-          ? longTemp.toLowerCase()
-          : longTemp;
-    const realpath = boundaryPath.safeRealpathSync;
     const stat = fs.statSync;
-    vi.spyOn(boundaryPath, "safeRealpathSync").mockImplementation((candidate) => {
-      if (candidate === previous) {
-        return testCase.unavailable === "previous" ? null : canonical;
-      }
-      if (candidate === proposed) {
-        return testCase.unavailable === "proposed" ? null : proposedCanonical;
-      }
-      return realpath(candidate);
-    });
     // Only the synthetic Windows aliases use fixture observations; ordinary I/O stays real.
     vi.spyOn(fs, "statSync").mockImplementation((...args: Parameters<typeof fs.statSync>) => {
-      if ([canonical, proposedCanonical].includes(String(args[0]))) {
+      const candidate = String(args[0]);
+      if (candidate === previous || candidate === proposed) {
+        if (
+          (testCase.unavailable === "previous" && candidate === previous) ||
+          (testCase.unavailable === "proposed" && candidate === proposed)
+        ) {
+          throw Object.assign(new Error("fixture directory missing"), { code: "ENOENT" });
+        }
         if (testCase.unavailable === "stat") {
           throw Object.assign(new Error("fixture access denied"), { code: "EACCES" });
         }
-        args[0] = testCase.file ? file : directory;
+        args[0] = testCase.file ? file : candidate === otherTemp ? differentDirectory : directory;
+        const observed = stat(...args);
+        if (observed && testCase.identity === "zero-inode") {
+          observed.ino = typeof observed.ino === "bigint" ? 0n : 0;
+        }
+        if (observed && testCase.identity === "other-device" && candidate === proposed) {
+          observed.dev = typeof observed.dev === "bigint" ? observed.dev + 1n : observed.dev + 1;
+        }
+        if (observed && testCase.identity === "unsafe-number") {
+          const inode = 9_007_199_254_740_992n + (candidate === proposed ? 1n : 0n);
+          observed.ino = typeof observed.ino === "bigint" ? inode : Number(inode);
+        }
+        return observed;
       }
       return stat(...args);
     });

@@ -1,12 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { normalizeWindowsPathForComparison, safeStatSync } from "@openclaw/fs-safe/path";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
-import {
-  resolveIdentityPathViaExistingAncestorSync,
-  safeRealpathSync,
-} from "../infra/boundary-path.js";
+import { resolveIdentityPathViaExistingAncestorSync } from "../infra/boundary-path.js";
 import { resolveEnvironmentValue } from "../infra/process-env.js";
 import { matchesVersionManagerPath } from "../shared/version-manager-path.js";
 
@@ -30,16 +26,20 @@ export function preserveServiceTmpDir(
   ) {
     return;
   }
-  const previousReal = safeRealpathSync(previous);
-  const proposedReal = safeRealpathSync(proposed);
-  if (
-    previousReal &&
-    proposedReal &&
-    normalizeWindowsPathForComparison(previousReal) ===
-      normalizeWindowsPathForComparison(proposedReal) &&
-    safeStatSync(previousReal)?.isDirectory()
-  ) {
-    environment.TMPDIR = previous;
+  try {
+    const previousStat = fs.statSync(previous, { bigint: true });
+    const proposedStat = fs.statSync(proposed, { bigint: true });
+    if (
+      previousStat.isDirectory() &&
+      proposedStat.isDirectory() &&
+      previousStat.ino !== 0n &&
+      previousStat.dev === proposedStat.dev &&
+      previousStat.ino === proposedStat.ino
+    ) {
+      environment.TMPDIR = previous;
+    }
+  } catch {
+    // Uninspectable paths remain subject to the strict preservation audit.
   }
 }
 
