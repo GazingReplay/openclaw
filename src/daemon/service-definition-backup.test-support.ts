@@ -171,9 +171,10 @@ async function fixture(
     // Windows path representation is adapted to the host's temporary directory.
     const readTaskFile = inspection.readTaskFile;
     vi.spyOn(inspection, "readTaskFile").mockImplementation(async (file, deadline) => {
-      const local = file.startsWith(windowsRoot) ? fromWindows(file) : file;
+      const virtual = file.startsWith(windowsRoot);
+      const local = virtual ? fromWindows(file) : file;
       const contents = await readTaskFile(local, deadline);
-      return /\.vbs$/iu.test(local) ? toWindows(contents) : contents;
+      return virtual && /\.vbs$/iu.test(local) ? toWindows(contents) : contents;
     });
     const readCommand = layout.readScheduledTaskCommand;
     vi.spyOn(layout, "readScheduledTaskCommand").mockImplementation(async (target, options) => {

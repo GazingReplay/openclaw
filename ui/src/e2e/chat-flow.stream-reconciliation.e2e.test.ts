@@ -1,5 +1,6 @@
 import path from "node:path";
 import { expect, it } from "vitest";
+import { createChatRunState } from "../../../src/gateway/server-chat-state.js";
 import {
   createChatFlowE2eSuite,
   installMockGateway,
@@ -60,6 +61,7 @@ suite.define(() => {
             { type: "text", text: notice, openclawStatusNotice: true },
             { type: "text", text: terminalAnswer },
           ],
+          openclawDisplayContent: [{ type: "text", text: notice, openclawStatusNotice: true }],
         },
       });
       await page.getByRole("button", { name: "Stop generating" }).waitFor({ state: "hidden" });
@@ -151,7 +153,7 @@ suite.define(() => {
           const inFlightRun = {
             runId,
             startedAt: 1_000,
-            text: steer ? `${text} Checking the follow-up.` : text,
+            text: steer ? "Checking the follow-up." : "",
             ...(tool ? { events: [toolEvent, itemEvent] } : {}),
           };
           const gateway = await installMockGateway(page, {
@@ -172,8 +174,16 @@ suite.define(() => {
             await gateway.emitGatewayEvent("agent", toolEvent);
             await gateway.emitGatewayEvent("agent", itemEvent);
           }
-          const persist = () =>
-            gateway.emitGatewayEvent("session.message", {
+          const persist = async () => {
+            await gateway.emitGatewayEvent("chat", {
+              sessionKey: "agent:main:main",
+              runId,
+              state: "delta",
+              replace: true,
+              deltaText: inFlightRun.text,
+              message: { role: "assistant", content: [{ type: "text", text: inFlightRun.text }] },
+            });
+            await gateway.emitGatewayEvent("session.message", {
               sessionKey: "agent:main:main",
               runId,
               hasActiveRun: true,
@@ -182,6 +192,7 @@ suite.define(() => {
               messageSeq: 2,
               message,
             });
+          };
           const snapshot = {
             messages: historyMessages,
             inFlightRun,
@@ -220,6 +231,7 @@ suite.define(() => {
             state: "final",
             message: {
               role: "assistant",
+              openclawDisplayContent: steer ? [{ type: "text", text: tailText }] : [],
               content: [
                 {
                   type: "text",
@@ -361,7 +373,7 @@ suite.define(() => {
         inFlightRun: {
           runId,
           startedAt: 1_000,
-          text: `${commentary.join("\n\n")}\n\nStill working.`,
+          text: "Still working.",
           events: [
             {
               runId,
@@ -414,20 +426,39 @@ suite.define(() => {
         const runId = requireString(requireRecord(send.params).idempotencyKey, "chat run id");
         const text = "Workspace changes are ready.";
         const partial = "Workspace";
-        const emitDelta = (snapshot: string, deltaText: string) =>
-          gateway.emitGatewayEvent("chat", {
+        const chatRunState = createChatRunState();
+        const emitWire = async () => {
+          const visible = chatRunState.resolveBuffer(runId).text;
+          const delta = chatRunState.takeBufferDelta(runId, visible);
+          if (!delta) {
+            return;
+          }
+          await gateway.emitGatewayEvent("chat", {
             sessionKey: "main",
             runId,
             state: "delta",
-            deltaText,
-            message: { role: "assistant", content: [{ type: "text", text: snapshot }] },
+            ...delta,
+            message: { role: "assistant", content: [{ type: "text", text: visible }] },
           });
+        };
+        const emitDelta = async (snapshot: string, deltaText: string) => {
+          chatRunState.updateBuffer(runId, {
+            itemId: "workspace-answer",
+            text: snapshot,
+            delta: deltaText,
+          });
+          await emitWire();
+        };
         if (persistence === "between deltas") {
           await emitDelta(partial, partial);
           await page.locator(".chat-bubble.streaming", { hasText: partial }).waitFor();
         }
         // Hold background refreshes so only the live message/delta boundary can repair the view.
         await gateway.deferNext("chat.history");
+        // The Gateway retires this item's wire text before publishing its saved row.
+        chatRunState.updateBuffer(runId, { itemId: "workspace-answer", text });
+        chatRunState.retireBuffer(runId, ["workspace-answer"]);
+        await emitWire();
         await gateway.emitGatewayEvent("session.message", {
           sessionKey: "main",
           runId,
@@ -493,7 +524,11 @@ suite.define(() => {
           runId,
           state: terminal,
           ...(terminal === "error" ? { errorMessage } : {}),
-          message: { role: "assistant", content: [{ type: "text", text }] },
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text }],
+            openclawDisplayContent: [],
+          },
         });
         await page.getByRole("button", { name: "Stop generating" }).waitFor({ state: "hidden" });
         await page.locator(".chat-working-indicator").waitFor({ state: "hidden" });
@@ -509,7 +544,14 @@ suite.define(() => {
             await failure.getByLabel("Error details", { exact: true }).textContent(),
           ).toContain(errorMessage);
         }
-        await emitDelta(text, text.slice(partial.length));
+        // A closed run still rejects a stale wire frame queued before retirement.
+        await gateway.emitGatewayEvent("chat", {
+          sessionKey: "main",
+          runId,
+          state: "delta",
+          deltaText: text.slice(partial.length),
+          message: { role: "assistant", content: [{ type: "text", text }] },
+        });
         await expect.poll(() => page.locator(".chat-bubble.streaming").count()).toBe(0);
         expect(
           (await page.locator(".chat-group.assistant .chat-text").allTextContents()).map((value) =>

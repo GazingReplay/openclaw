@@ -85,7 +85,10 @@ export function registerDoctorWindowsServiceTests(
         const audited = mocks.auditGatewayServiceConfig.mock.calls[0]?.[0]?.command;
         expect(audited?.programArguments).toEqual(f.command.programArguments);
         expect(audited?.startupEntryPaths).toBeUndefined();
-        expect(f.task).toHaveBeenCalledWith(["/Query", "/TN", resolveTaskName(f.env), "/XML"]);
+        expect(f.task).toHaveBeenCalledWith(
+          ["/Query", "/TN", resolveTaskName(f.env), "/XML"],
+          undefined,
+        );
         expectNoNoteContaining("inspection could not be completed", "Gateway service definition");
         expect(await f.registration()).toEqual(f.originalRegistration);
         expect(await fs.readFile(f.sourcePath)).toEqual(f.original);
