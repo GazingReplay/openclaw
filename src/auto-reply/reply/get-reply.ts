@@ -280,23 +280,6 @@ export async function getReplyFromConfig(
         agentId,
       },
     });
-  // Unauthorized commands owe no further reply; authorized empty results still do.
-  const finishCommandTurn = (reply: ReplyPayload | ReplyPayload[] | undefined) => {
-    const runState = resolveReplyOperationRunState(opts);
-    if (
-      runState &&
-      runState.replyCompletion?.outcome !== "blocked" &&
-      (Array.isArray(reply) ? reply.length === 0 : !reply) &&
-      !resolveCommandAuthorization({
-        ctx: finalized,
-        cfg,
-        commandAuthorized: finalized.CommandAuthorized,
-      }).isAuthorizedSender
-    ) {
-      runState.replyCompletion = resolveReplyCompletion("optional", "empty");
-    }
-    return reply;
-  };
   const traceGetReplyPhase = <T>(name: string, run: () => Promise<T> | T): Promise<T> =>
     resolverTiming.measure(name, () =>
       measureDiagnosticsTimelineSpan(name, run, {
@@ -422,7 +405,12 @@ export async function getReplyFromConfig(
   );
   if (nativeSlashCommandFastReply.handled) {
     logResolverTiming("completed", "native_slash_command_fast_path");
-    return finishCommandTurn(nativeSlashCommandFastReply.reply);
+    return finishCommandTurn({
+      opts,
+      ctx: finalized,
+      cfg,
+      reply: nativeSlashCommandFastReply.reply,
+    });
   }
   const optsWithCommandQueueOverride = nativeSlashCommandFastReply.queueModeOverride
     ? { ...optsWithSkillFilter, queueModeOverride: nativeSlashCommandFastReply.queueModeOverride }
@@ -874,7 +862,7 @@ export async function getReplyFromConfig(
   );
   if (directiveResult.kind === "reply") {
     logResolverTiming("completed", "directive_reply");
-    return finishCommandTurn(directiveResult.reply);
+    return finishCommandTurn({ opts, ctx: finalized, cfg, reply: directiveResult.reply });
   }
   const {
     command,
@@ -986,7 +974,7 @@ export async function getReplyFromConfig(
   await maybeEmitMissingResetHooks();
   if (inlineActionResult.kind === "reply") {
     logResolverTiming("completed", "inline_action_reply");
-    return finishCommandTurn(inlineActionResult.reply);
+    return finishCommandTurn({ opts, ctx: finalized, cfg, reply: inlineActionResult.reply });
   }
   directives = inlineActionResult.directives;
   cleanedBody = inlineActionResult.cleanedBody;
