@@ -1,6 +1,5 @@
 import path from "node:path";
 import { expect, it } from "vitest";
-import { createChatRunState } from "../../../src/gateway/server-chat-state.js";
 import {
   createChatFlowE2eSuite,
   installMockGateway,
@@ -12,35 +11,24 @@ import { createControlUiE2eContextOptions } from "./control-ui-e2e-suite.test-su
 const suite = createChatFlowE2eSuite();
 
 suite.define(() => {
-  it("reconciles a fallback notice around one streamed terminal answer", async () => {
+  it("keeps a saved terminal answer once when its fallback notice arrives", async () => {
     await suite.withPage(createControlUiE2eContextOptions(), async ({ page }) => {
       const runId = "fallback-terminal-run";
       const answer = "The workspace check is complete.";
       const notice =
         "Model Fallback: backup/model (selected primary/model; selected model unavailable)";
-      const terminalAnswer = [
-        "<relevant-memories>",
-        "Internal memory context",
-        "</relevant-memories>",
-        answer,
-      ].join("\n");
       const user = {
         role: "user",
         content: [{ type: "text", text: "Check the workspace." }],
         __openclaw: { id: "fallback-user", seq: 1, idempotencyKey: `${runId}:user` },
       };
-      const streamedAnswer = {
+      const savedAnswer = {
         role: "assistant",
         content: [{ type: "text", text: answer }],
-        openclawStreamFallback: {
-          itemId: "fallback-answer-item",
-          replacementText: answer,
-          runId,
-          source: "segment",
-        },
+        __openclaw: { id: "fallback-answer", seq: 2, runId },
       };
       const gateway = await installMockGateway(page, {
-        historyMessages: [user, streamedAnswer],
+        historyMessages: [user, savedAnswer],
         inFlightRun: { runId, startedAt: 1_000, text: "" },
         sessionInfo: {
           activeRunIds: [runId],
@@ -51,17 +39,24 @@ suite.define(() => {
 
       await page.goto(`${suite.server.baseUrl}chat`);
       await page.getByRole("button", { name: "Stop generating" }).waitFor();
+      await gateway.deferNext("chat.history");
       await gateway.emitGatewayEvent("chat", {
         sessionKey: "agent:main:main",
         runId,
         state: "final",
         message: {
           role: "assistant",
-          content: [
-            { type: "text", text: notice, openclawStatusNotice: true },
-            { type: "text", text: terminalAnswer },
-          ],
-          openclawDisplayContent: [{ type: "text", text: notice, openclawStatusNotice: true }],
+          content: [{ type: "text", text: answer }],
+          openclawDisplayContent: [],
+        },
+      });
+      await gateway.emitGatewayEvent("chat", {
+        sessionKey: "agent:main:main",
+        runId,
+        state: "final",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: notice, openclawStatusNotice: true }],
         },
       });
       await page.getByRole("button", { name: "Stop generating" }).waitFor({ state: "hidden" });
@@ -78,6 +73,7 @@ suite.define(() => {
           text.includes(answer),
         ).length;
       await expect.poll(answerOccurrences).toBe(1);
+      expect(await page.locator(".chat-bubble.streaming").count()).toBe(0);
     });
   });
 
@@ -174,16 +170,8 @@ suite.define(() => {
             await gateway.emitGatewayEvent("agent", toolEvent);
             await gateway.emitGatewayEvent("agent", itemEvent);
           }
-          const persist = async () => {
-            await gateway.emitGatewayEvent("chat", {
-              sessionKey: "agent:main:main",
-              runId,
-              state: "delta",
-              replace: true,
-              deltaText: inFlightRun.text,
-              message: { role: "assistant", content: [{ type: "text", text: inFlightRun.text }] },
-            });
-            await gateway.emitGatewayEvent("session.message", {
+          const persist = () =>
+            gateway.emitGatewayEvent("session.message", {
               sessionKey: "agent:main:main",
               runId,
               hasActiveRun: true,
@@ -192,7 +180,6 @@ suite.define(() => {
               messageSeq: 2,
               message,
             });
-          };
           const snapshot = {
             messages: historyMessages,
             inFlightRun,
@@ -231,7 +218,6 @@ suite.define(() => {
             state: "final",
             message: {
               role: "assistant",
-              openclawDisplayContent: steer ? [{ type: "text", text: tailText }] : [],
               content: [
                 {
                   type: "text",
@@ -242,6 +228,7 @@ suite.define(() => {
                       : text,
                 },
               ],
+              openclawDisplayContent: steer ? [{ type: "text", text: tailText }] : [],
             },
           });
           await page.getByRole("button", { name: "Stop generating" }).waitFor({ state: "hidden" });
@@ -260,6 +247,7 @@ suite.define(() => {
             ),
           ).toEqual(steer ? [text, tailText] : [text]);
           expect(await page.locator(".chat-duplicate-count").count()).toBe(0);
+          expect(await page.locator(".chat-bubble.streaming").count()).toBe(0);
           if (tool) {
             expect(await page.locator(".chat-tool-msg-summary").count()).toBe(1);
           }
@@ -412,8 +400,8 @@ suite.define(() => {
   });
 
   it.each([
-    { persistence: "between deltas", terminal: "final" },
-    { persistence: "before streaming", terminal: "error" },
+    { persistence: "after partial streaming", terminal: "final" },
+    { persistence: "before first stream", terminal: "error" },
   ])(
     "keeps one answer during workspace reconciliation with persistence $persistence and $terminal",
     async ({ persistence, terminal }) => {
@@ -426,39 +414,25 @@ suite.define(() => {
         const runId = requireString(requireRecord(send.params).idempotencyKey, "chat run id");
         const text = "Workspace changes are ready.";
         const partial = "Workspace";
-        const chatRunState = createChatRunState();
-        const emitWire = async () => {
-          const visible = chatRunState.resolveBuffer(runId).text;
-          const delta = chatRunState.takeBufferDelta(runId, visible);
-          if (!delta) {
-            return;
-          }
-          await gateway.emitGatewayEvent("chat", {
+        const emitDelta = (snapshot: string, deltaText: string, replace = false) =>
+          gateway.emitGatewayEvent("chat", {
             sessionKey: "main",
             runId,
             state: "delta",
-            ...delta,
-            message: { role: "assistant", content: [{ type: "text", text: visible }] },
+            deltaText,
+            ...(replace ? { replace: true } : {}),
+            message: { role: "assistant", content: [{ type: "text", text: snapshot }] },
           });
-        };
-        const emitDelta = async (snapshot: string, deltaText: string) => {
-          chatRunState.updateBuffer(runId, {
-            itemId: "workspace-answer",
-            text: snapshot,
-            delta: deltaText,
-          });
-          await emitWire();
-        };
-        if (persistence === "between deltas") {
+        if (persistence === "after partial streaming") {
           await emitDelta(partial, partial);
           await page.locator(".chat-bubble.streaming", { hasText: partial }).waitFor();
         }
         // Hold background refreshes so only the live message/delta boundary can repair the view.
         await gateway.deferNext("chat.history");
-        // The Gateway retires this item's wire text before publishing its saved row.
-        chatRunState.updateBuffer(runId, { itemId: "workspace-answer", text });
-        chatRunState.retireBuffer(runId, ["workspace-answer"]);
-        await emitWire();
+        if (persistence === "after partial streaming") {
+          // The Gateway retires committed text before publishing its durable row.
+          await emitDelta("", "", true);
+        }
         await gateway.emitGatewayEvent("session.message", {
           sessionKey: "main",
           runId,
@@ -482,10 +456,6 @@ suite.define(() => {
           },
         });
         await page.locator(".chat-group.assistant .chat-text", { hasText: text }).waitFor();
-        if (persistence === "before streaming") {
-          await emitDelta(partial, partial);
-        }
-        await emitDelta(text, text.slice(partial.length));
         await gateway.emitGatewayEvent("agent", {
           sessionKey: "main",
           runId,
@@ -494,7 +464,7 @@ suite.define(() => {
           stream: "lifecycle",
           data: { phase: "finishing" },
         });
-        // Positive telemetry proves a render after the deltas; absence alone can pass on the old frame.
+        // Positive telemetry proves a render after persistence; absence alone can pass on the old frame.
         await gateway.emitGatewayEvent("agent", {
           sessionKey: "main",
           runId,
@@ -544,14 +514,7 @@ suite.define(() => {
             await failure.getByLabel("Error details", { exact: true }).textContent(),
           ).toContain(errorMessage);
         }
-        // A closed run still rejects a stale wire frame queued before retirement.
-        await gateway.emitGatewayEvent("chat", {
-          sessionKey: "main",
-          runId,
-          state: "delta",
-          deltaText: text.slice(partial.length),
-          message: { role: "assistant", content: [{ type: "text", text }] },
-        });
+        await emitDelta(text, text.slice(partial.length));
         await expect.poll(() => page.locator(".chat-bubble.streaming").count()).toBe(0);
         expect(
           (await page.locator(".chat-group.assistant .chat-text").allTextContents()).map((value) =>
