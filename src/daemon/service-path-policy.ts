@@ -1,9 +1,47 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { normalizeWindowsPathForComparison, safeStatSync } from "@openclaw/fs-safe/path";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
-import { resolveIdentityPathViaExistingAncestorSync } from "../infra/boundary-path.js";
+import {
+  resolveIdentityPathViaExistingAncestorSync,
+  safeRealpathSync,
+} from "../infra/boundary-path.js";
+import { resolveEnvironmentValue } from "../infra/process-env.js";
 import { matchesVersionManagerPath } from "../shared/version-manager-path.js";
+
+/** Shell and desktop TEMP can name the same Windows directory through different 8.3 aliases. */
+export function preserveServiceTmpDir(
+  environment: Record<string, string | undefined>,
+  existing: Record<string, string | undefined> | undefined,
+  platform: NodeJS.Platform,
+): void {
+  if (platform !== "win32") {
+    return;
+  }
+  const previous = resolveEnvironmentValue(existing, "TMPDIR", platform);
+  const proposed = resolveEnvironmentValue(environment, "TMPDIR", platform);
+  if (
+    !previous?.trim() ||
+    !proposed?.trim() ||
+    ![previous, proposed].every(
+      (value) => path.win32.isAbsolute(value) && path.win32.parse(value).root.length > 1,
+    )
+  ) {
+    return;
+  }
+  const previousReal = safeRealpathSync(previous);
+  const proposedReal = safeRealpathSync(proposed);
+  if (
+    previousReal &&
+    proposedReal &&
+    normalizeWindowsPathForComparison(previousReal) ===
+      normalizeWindowsPathForComparison(proposedReal) &&
+    safeStatSync(previousReal)?.isDirectory()
+  ) {
+    environment.TMPDIR = previous;
+  }
+}
 
 export function normalizeServicePathEntry(entry: string, platform: NodeJS.Platform): string {
   const pathModule = platform === "win32" ? path.win32 : path.posix;
